@@ -4,6 +4,37 @@ const ORIGIN = 'https://agentswarm.space';
 const USER_AGENT = 'agentswarm-remote/1.0 (+https://github.com/andrewsiah/agentswarm-remote)';
 const ID_PATTERN = '^[A-Za-z0-9_-]{1,100}$';
 const MAX_BODY = 64 * 1024;
+const MCP_VERSIONS = ['2025-06-18', '2025-11-25'];
+const UPSTREAM_FAILURE = 'Public upstream unavailable or timed out. No automatic retry was made.';
+
+// Store serialized public projections so the byte cap covers keys and UTF-8 payloads.
+export class ProjectionCache {
+  entries = new Map();
+  bytes = 0;
+  delete(key) {
+    const entry = this.entries.get(key);
+    if (entry) { this.bytes -= entry.bytes; this.entries.delete(key); }
+  }
+  get(key) {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    if (entry.expiresAt <= Date.now()) { this.delete(key); return; }
+    return JSON.parse(entry.serialized);
+  }
+  set(key, saved) {
+    this.delete(key);
+    for (const [id, entry] of this.entries) if (entry.expiresAt <= Date.now()) this.delete(id);
+    const serialized = JSON.stringify(saved);
+    const bytes = new TextEncoder().encode(key + serialized).byteLength;
+    if (bytes > 5 * 1024 * 1024 || saved.expiresAt <= Date.now()) return;
+    while (this.entries.size >= 500 || this.bytes + bytes > 5 * 1024 * 1024) this.delete(this.entries.keys().next().value);
+    this.entries.set(key, { serialized, expiresAt: saved.expiresAt, bytes });
+    this.bytes += bytes;
+  }
+}
+const projections = new ProjectionCache();
+const inFlight = new Map();
+const upstreamStarts = [];
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = (maxLength, extra = {}) => ({ type: 'string', maxLength, ...extra });
 const tool = (name, description, properties = {}, required = []) => ({
@@ -20,7 +51,7 @@ export const tools = [
   tool('how_to_register', 'Get the exact direct registration request, field limits and credential-saving advice. This server never registers you or receives your credentials.'),
 ];
 class RpcError extends Error {
-  constructor(code, message, status = 200) { super(message); this.code = code; this.status = status; }
+  constructor(code, message, status = 200, data) { super(message); this.code = code; this.status = status; this.data = data; }
 }
 function validate(schema, value) {
   if (schema.type === 'object') {
@@ -39,11 +70,18 @@ function validate(schema, value) {
 const cut = value => typeof value === 'string' ? value.length > 4000 ? value.slice(0, 3987) + '… [truncated]' : value : value;
 const select = (value, keys) => Object.fromEntries(keys.filter(key => value?.[key] !== undefined && (value[key] === null || ['string', 'number', 'boolean'].includes(typeof value[key]))).map(key => [key, cut(value[key])]));
 const payer = p => p.paidBy ?? (p.bounty?.amountUsd != null ? 'escrow' : p.reward ? 'shared' : typeof p.bounty?.sourceUrl === 'string' ? 'source' : p.bounty?.sourceUrl === null ? 'poster' : 'unknown');
+function bountyView(bounty) {
+  const view = select(bounty, ['reward', 'amountUsd', 'netUsd', 'feeUsd', 'status', 'sourceUrl', 'deadline', 'submissionsCloseAt', 'splitRule', 'reviewRule', 'reviewers', 'challengeHours', 'escrowState', 'heldUsd', 'payoutsNextCursor']);
+  if (bounty.shares === null) view.shares = null;
+  else if (Array.isArray(bounty.shares) && bounty.shares.length >= 1 && bounty.shares.length <= 5 && bounty.shares.every(n => Number.isInteger(n) && n >= 1 && n <= 100) && bounty.shares.reduce((a, b) => a + b, 0) === 100) view.shares = [...bounty.shares];
+  if (Array.isArray(bounty.payouts)) view.payouts = bounty.payouts.slice(0, 20).filter(object).map(p => select(p, ['resultId', 'amountUsd', 'netUsd', 'feeUsd', 'status', 'releaseAt']));
+  return view;
+}
 function taskView(p) {
   const deadline = p.bounty?.submissionsCloseAt ?? p.bounty?.deadline ?? p.closesAt ?? null;
   return {
     ...select(p, ['id', 'title', 'type', 'body', 'status', 'doneWhen', 'hidden', 'removed', 'deleted', 'acceptedResultId', 'closesAt', 'valueUsd', 'netUsd', 'feeUsd']),
-    bounty: p.bounty ? select(p.bounty, ['reward', 'amountUsd', 'netUsd', 'feeUsd', 'status', 'sourceUrl', 'deadline', 'submissionsCloseAt', 'splitRule']) : null,
+    bounty: p.bounty ? bountyView(p.bounty) : null,
     ...(p.reward ? { reward: select(p.reward, ['amountUsd', 'freeUsd', 'promisedUsd', 'funders', 'approvalsNeeded']) } : {}),
     paidBy: cut(payer(p)), deadline: cut(deadline),
     terms: { doneWhen: Boolean(p.doneWhen?.trim()), reward: Boolean(p.bounty?.reward || p.bounty?.amountUsd || p.reward?.amountUsd), deadline: Boolean(deadline) },
@@ -55,17 +93,21 @@ function project(path, page) {
   if (path.startsWith('/api/posts/') && typeof page?.post?.id === 'string') return { post: taskView(page.post) };
   throw new Error('Invalid upstream response.');
 }
-async function upstream(path) {
-  if (!['/api/feed?type=task', '/api/bounties'].includes(path) && !new RegExp(`^/api/posts/[A-Za-z0-9_-]{1,100}$`).test(path)) throw new Error('Invalid upstream path.');
+async function loadProjection(path) {
   // Cache only the public projection; never raw replies, request headers or credentials.
   const key = new Request(`${ORIGIN}${path}`, { method: 'GET' });
-  const hit = await caches.default.match(key);
-  if (hit) {
-    const saved = await hit.json();
-    if (saved.error) throw new Error(saved.error);
-    return saved;
-  }
-  const ttl = path.startsWith('/api/posts/') ? 120 : 60;
+  try {
+    const hit = await caches.default.match(key);
+    const saved = hit && await hit.json();
+    if (saved?.expiresAt > Date.now() && object(saved.result)) {
+      projections.set(path, saved);
+      return saved.result;
+    }
+  } catch { /* Cache API is optional; the isolate cache and budget still apply. */ }
+  const now = Date.now();
+  while (upstreamStarts.length && upstreamStarts[0] <= now - 60000) upstreamStarts.shift();
+  if (upstreamStarts.length >= 30) throw new RpcError(-32000, 'Public upstream busy, retry later.', 200, { retryAfterSeconds: Math.max(1, Math.ceil((upstreamStarts[0] + 60000 - now) / 1000)) });
+  upstreamStarts.push(now);
   let result;
   try {
     const response = await fetch(key.url, {
@@ -78,9 +120,28 @@ async function upstream(path) {
     }
     result = project(path, await response.json());
   } catch {
-    result = { error: 'Public upstream unavailable or timed out. No automatic retry was made.' };
+    result = { error: UPSTREAM_FAILURE };
   }
-  await caches.default.put(key, new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${ttl}` } }));
+  const ttl = result.error ? 15 : path.startsWith('/api/posts/') ? 120 : 60;
+  const saved = { result, expiresAt: Date.now() + ttl * 1000 };
+  projections.set(path, saved);
+  try {
+    await caches.default.put(key, new Response(JSON.stringify(saved), { headers: { 'Content-Type': 'application/json', 'Cache-Control': `public, max-age=${ttl}` } }));
+  } catch { /* A cache write failure must not bypass the isolate budget or cache. */ }
+  return result;
+}
+async function upstream(path) {
+  if (!['/api/feed?type=task', '/api/bounties'].includes(path) && !new RegExp(`^/api/posts/[A-Za-z0-9_-]{1,100}$`).test(path)) throw new Error('Invalid upstream path.');
+  let result = projections.get(path)?.result;
+  if (!result) {
+    let pending = inFlight.get(path);
+    if (!pending) {
+      pending = loadProjection(path);
+      inFlight.set(path, pending);
+    }
+    try { result = await pending; }
+    finally { if (inFlight.get(path) === pending) inFlight.delete(path); }
+  }
   if (result.error) throw new Error(result.error);
   return result;
 }
@@ -119,7 +180,7 @@ async function callTool(name, args, foundVia) {
     data = {
       tasks: page.items.filter(p => `${p.title ?? ''}\n${p.body ?? ''}`.toLowerCase().includes(query)).sort((a, b) => score(b) - score(a)).slice(0, args.limit ?? 20),
       nextCursor: page.nextCursor,
-      scope: 'Search and limit cover only the first public feed page, with cached bodies truncated to 4000 characters. Closed tasks can appear. Ranking favors the number of stated terms: doneWhen, reward and deadline. Use list_bounties for paid opportunities and get_task for full available terms.',
+      scope: 'Search and limit cover only the first public feed page, with cached bodies truncated to 4000 characters. Closed tasks can appear. Ranking favors the number of stated terms: doneWhen, reward and deadline. Use list_bounties for paid opportunities and get_task for projected task details, bounty terms and the first payout page; strings remain truncated and replies are excluded.',
     };
   }
   return { contentNotice: CONTENT_NOTICE, limits: LIMITS, data };
@@ -142,7 +203,7 @@ async function mcp(rpc) {
   const params = rpc.params ?? {};
   if (rpc.method === 'initialize') {
     if (typeof params.protocolVersion !== 'string' || !object(params.capabilities) || !object(params.clientInfo) || typeof params.clientInfo.name !== 'string' || typeof params.clientInfo.version !== 'string') throw new RpcError(-32602, 'Invalid initialize parameters.');
-    return { protocolVersion: ['2025-06-18', '2025-11-25'].includes(params.protocolVersion) ? params.protocolVersion : '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 'agentswarm-remote', version: '1.1.0' }, instructions: `${CONTENT_NOTICE} ${LIMITS} Never send credentials to this server.` };
+    return { protocolVersion: MCP_VERSIONS.includes(params.protocolVersion) ? params.protocolVersion : '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 'agentswarm-remote', version: '1.1.0' }, instructions: `${CONTENT_NOTICE} ${LIMITS} Never send credentials to this server.` };
   }
   if (rpc.method === 'ping') return {};
   if (rpc.method === 'tools/list') {
@@ -156,7 +217,7 @@ async function mcp(rpc) {
       return { content: [{ type: 'text', text: resultText(data) }], structuredContent: data, isError: false };
     } catch (error) {
       if (error instanceof RpcError) throw error;
-      return { content: [{ type: 'text', text: 'Public upstream unavailable or timed out. No automatic retry was made.' }], isError: true };
+      return { content: [{ type: 'text', text: UPSTREAM_FAILURE }], isError: true };
     }
   }
   throw new RpcError(-32601, 'Method not found.');
@@ -175,7 +236,9 @@ async function a2a(rpc, request) {
   const version = request.headers.get('A2A-Version') || '0.3';
   if (!['1.0', '0.3', '0.3.0'].includes(version)) throw new RpcError(-32009, 'A2A version not supported.');
   const current = version === '1.0';
-  if (['tasks/get', 'GetTask'].includes(rpc.method)) {
+  if (['message/stream', 'SendStreamingMessage', 'tasks/resubscribe', 'SubscribeToTask', 'agent/getAuthenticatedExtendedCard', 'GetExtendedAgentCard'].includes(rpc.method)) throw new RpcError(-32004, 'Streaming, subscriptions and extended cards are not supported.');
+  if (['tasks/pushNotificationConfig/set', 'tasks/pushNotificationConfig/get', 'tasks/pushNotificationConfig/list', 'tasks/pushNotificationConfig/delete', 'CreateTaskPushNotificationConfig', 'GetTaskPushNotificationConfig', 'ListTaskPushNotificationConfigs', 'DeleteTaskPushNotificationConfig'].includes(rpc.method)) throw new RpcError(-32003, 'Push notifications are not supported.');
+  if (['tasks/get', 'GetTask', 'tasks/cancel', 'CancelTask'].includes(rpc.method)) {
     validate({ type: 'object', properties: { id: text(100, { minLength: 1, pattern: ID_PATTERN }), historyLength: { type: 'integer', minimum: 0, maximum: 100 } }, required: ['id'] }, rpc.params ?? {});
     throw new RpcError(-32001, 'Task not found. This endpoint stores no task state.');
   }
@@ -195,7 +258,7 @@ async function a2a(rpc, request) {
   try { data = await callTool(name, args, 'a2a-v1'); }
   catch (error) {
     if (error instanceof RpcError) throw error;
-    throw new RpcError(-32603, 'Public upstream unavailable or timed out. No automatic retry was made.');
+    throw new RpcError(-32603, UPSTREAM_FAILURE);
   }
   const response = {
     messageId: crypto.randomUUID(), contextId: message.contextId || crypto.randomUUID(),
@@ -207,7 +270,22 @@ async function a2a(rpc, request) {
 }
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept, MCP-Protocol-Version, Mcp-Session-Id, A2A-Version, A2A-Extensions', 'Access-Control-Expose-Headers': 'Allow', 'Cache-Control': 'no-store' };
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...CORS, 'Content-Type': 'application/json' } });
-const rpcError = (id, error) => json({ jsonrpc: '2.0', id, error: { code: error.code, message: error.message } }, error.status ?? 200);
+const rpcError = (id, error) => json({ jsonrpc: '2.0', id, error: { code: error.code, message: error.message, ...(error.data ? { data: error.data } : {}) } }, error.status ?? 200);
+function acceptsJson(accept) {
+  if (accept === null) return true;
+  let specificity = -1, quality = 0;
+  for (const range of accept.split(',')) {
+    const [type, ...params] = range.trim().toLowerCase().split(';').map(p => p.trim());
+    const rank = ['*/*', 'application/*', 'application/json'].indexOf(type);
+    if (rank < 0) continue;
+    const q = params.find(p => /^q\s*=/.test(p));
+    const value = q ? Number(q.slice(q.indexOf('=') + 1).trim()) : 1;
+    const weight = Number.isFinite(value) && value >= 0 && value <= 1 ? value : 0;
+    if (rank > specificity) { specificity = rank; quality = weight; }
+    else if (rank === specificity) quality = Math.max(quality, weight);
+  }
+  return quality > 0;
+}
 async function readRpc(request) {
   if (Number(request.headers.get('Content-Length')) > MAX_BODY) throw new RpcError(-32600, 'Request body exceeds 64 KB.', 413);
   const reader = request.body?.getReader();
@@ -238,9 +316,14 @@ export default {
     const known = ['/', '/mcp', '/a2a', '/.well-known/agent-card.json', '/.well-known/agent.json'].includes(url.pathname);
     if (!known) return json({ error: 'Not found.' }, 404);
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+    if (url.pathname === '/mcp') {
+      const version = request.headers.get('MCP-Protocol-Version');
+      if (version !== null && !MCP_VERSIONS.includes(version)) return json({ error: 'Unsupported MCP-Protocol-Version.' }, 400);
+    }
     if (request.method === 'GET' && url.pathname === '/') return new Response(`agentswarm.space: public read-only task discovery.\nMCP: ${url.origin}/mcp\nA2A 1.0: ${url.origin}/.well-known/agent-card.json\nA2A 0.3: ${url.origin}/.well-known/agent.json\nDocs: https://github.com/andrewsiah/agentswarm-remote\nSkill: ${ORIGIN}/skill.md\n${LIMITS}\nNever send credentials here.\n`, { headers: { ...CORS, 'Content-Type': 'text/plain; charset=utf-8' } });
     if (request.method === 'GET' && url.pathname.startsWith('/.well-known/')) return json(agentCard(url.origin, url.pathname.endsWith('/agent.json')));
     if (request.method !== 'POST' || !['/mcp', '/a2a'].includes(url.pathname)) return new Response(null, { status: 405, headers: { ...CORS, Allow: ['/mcp', '/a2a'].includes(url.pathname) ? 'POST, OPTIONS' : 'GET, OPTIONS' } });
+    if (url.pathname === '/mcp' && !acceptsJson(request.headers.get('Accept'))) return json({ error: 'Accept must allow application/json.' }, 406);
     if (request.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase() !== 'application/json') return json({ error: 'Content-Type must be application/json.' }, 415);
     let rpc;
     try {
