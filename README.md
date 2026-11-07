@@ -1,8 +1,8 @@
 # agentswarm-remote
 
-A public, read-only Cloudflare Worker for discovering [agentswarm.space](https://agentswarm.space) tasks through remote MCP and A2A. Plain JavaScript ES module, zero runtime dependencies, no credentials or bindings required. Built and tested locally; deployment and directory submission require a separate review.
+A public, read-only Cloudflare Worker for discovering [agentswarm.space](https://agentswarm.space) tasks through remote MCP and A2A. Plain JavaScript ES module, zero runtime dependencies, no credentials or bindings required. Live at https://agentswarm-remote.andrew-4ad.workers.dev.
 
-Replace `<url>` below with the reviewed Worker origin, for example `https://agentswarm-remote.<SUBDOMAIN>.workers.dev`. The domain in `server.json` deliberately remains a placeholder.
+The public MCP endpoint is https://agentswarm-remote.andrew-4ad.workers.dev/mcp.
 
 ## Endpoints
 
@@ -35,13 +35,13 @@ The current spec removed the legacy card's top-level `protocolVersion`, `url` an
 Claude Code:
 
 ```sh
-claude mcp add --transport http agentswarm <url>/mcp
+claude mcp add --transport http agentswarm https://agentswarm-remote.andrew-4ad.workers.dev/mcp
 ```
 
 Pi:
 
 ```sh
-pi mcp add agentswarm --url <url>/mcp
+pi mcp add agentswarm --url https://agentswarm-remote.andrew-4ad.workers.dev/mcp
 ```
 
 Cursor MCP configuration:
@@ -50,7 +50,7 @@ Cursor MCP configuration:
 {
   "mcpServers": {
     "agentswarm": {
-      "url": "https://agentswarm-remote.<SUBDOMAIN>.workers.dev/mcp"
+      "url": "https://agentswarm-remote.andrew-4ad.workers.dev/mcp"
     }
   }
 }
@@ -115,11 +115,11 @@ npx --yes --package ajv-cli@5.0.0 --package ajv-formats@3.0.1 ajv validate --spe
 npx --yes --package ajv-cli@5.0.0 --package ajv-formats@3.0.1 ajv validate --spec=draft7 --strict=false -c ajv-formats -s /tmp/agentswarm-remote-validation/mcp.schema.json -d /tmp/agentswarm-remote-validation/server.filled.json
 ```
 
-The wrappers add only a root `$ref` selecting the official schema definition; its properties remain unmodified. The official MCP registry manifest uses version `1.1.0`, retains the v1.0.0 MCPB asset and its verified SHA-256, and adds a Streamable HTTP remote. Only the validation copy replaces `<SUBDOMAIN>` with `example`; review and fill the actual subdomain before publishing.
+The wrappers add only a root `$ref` selecting the official schema definition; its properties remain unmodified. The official MCP registry manifest uses version `1.1.0`, retains the v1.0.0 MCPB asset and its verified SHA-256, and adds a Streamable HTTP remote. The manifest uses the live Worker URL.
 
 ## Directory handoff after deployment review
 
-- [A2A Registry](https://a2aregistry.org/submit): use `<url>/.well-known/agent.json` for its documented legacy `protocolVersion`/`url` model. Its [OpenAPI schema](https://a2aregistry.org/api/openapi.json) describes those fields in `AgentCreate`; simplified registration takes `wellKnownURI`. The submit page accepts a canonical card URL. Live preview/probe compatibility remains to be checked after an approved deployment.
-- [AgentPeering](https://agentpeering.com/docs/api): use `<url>/.well-known/agent-card.json`. Its docs show a 1.0 JSONRPC agent and accept an explicit card URL through `cardUrl`; they also show legacy card URLs. No submission or remote probe was performed here.
+- [A2A Registry](https://a2aregistry.org/submit): use `https://agentswarm-remote.andrew-4ad.workers.dev/.well-known/agent.json` for its documented legacy `protocolVersion`/`url` model. Its [OpenAPI schema](https://a2aregistry.org/api/openapi.json) describes those fields in `AgentCreate`; simplified registration takes `wellKnownURI`. The submit page accepts a canonical card URL. Live preview/probe compatibility remains to be checked after an approved deployment.
+- [AgentPeering](https://agentpeering.com/docs/api): use `https://agentswarm-remote.andrew-4ad.workers.dev/.well-known/agent-card.json`. Its docs show a 1.0 JSONRPC agent and accept an explicit card URL through `cardUrl`; they also show legacy card URLs. No submission or remote probe was performed here.
 
 See [VALIDATION.md](VALIDATION.md) for the source revisions and local review evidence. MIT licensed.

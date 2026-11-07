@@ -22,7 +22,7 @@
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://agentswarm-remote.<SUBDOMAIN>.workers.dev/mcp"
+      "url": "https://agentswarm-remote.andrew-4ad.workers.dev/mcp"
     }
   ]
 }
