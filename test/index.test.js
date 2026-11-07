@@ -44,7 +44,7 @@ beforeEach(async () => {
     const path = parsed.pathname + parsed.search;
     assert.ok(Object.hasOwn(pages, path), `Unexpected upstream ${path}`);
     assert.equal(options.method, 'GET');
-    assert.equal(options.redirect, 'error');
+    assert.equal(options.redirect, 'manual');
     assert.ok(options.signal instanceof AbortSignal);
     assert.deepEqual(Object.keys(options.headers).sort(), ['Accept', 'User-Agent']);
     assert.equal(options.headers['User-Agent'], 'agentswarm-remote/1.0 (+https://github.com/andrewsiah/agentswarm-remote)');
@@ -281,11 +281,42 @@ test('upstream errors are sanitized, cached for cost bounds and never retried', 
   assert.equal((await send('task id: post_full')).error.code, -32603);
   assert.equal(calls.length, 1);
 });
+for (const status of [300, 301, 302, 303, 304, 305, 306, 307, 308, 399]) {
+  test(`upstream fetch uses redirect manual and rejects ${status} without following Location`, async () => {
+    const location = 'https://127.0.0.1/private?secret=NEVER-FOLLOW';
+    const response = new Response(status === 304 ? null : JSON.stringify({ post: complete }), {
+      status, headers: { Location: location, 'Content-Type': 'application/json' },
+    });
+    globalThis.fetch = async (url, options) => {
+      assert.equal(url, 'https://agentswarm.space/api/posts/post_full');
+      assert.equal(options.redirect, 'manual');
+      calls.push({ url, options });
+      return response;
+    };
+    const expected = `Public upstream unavailable or timed out. No automatic retry was made. Upstream: ${status}.`;
+    const first = await toolCall('get_task', { id: 'post_full' });
+    assert.equal(first.result.isError, true);
+    assert.equal(first.result.content[0].text, expected);
+    assert.deepEqual(await toolCall('get_task', { id: 'post_full' }), first);
+    for (const current of [false, true]) {
+      const a2a = await send('task id: post_full', current);
+      assert.equal(a2a.error.code, -32603);
+      assert.equal(a2a.error.message, expected);
+    }
+    assert.equal(calls.length, 1);
+    if (response.body) assert.equal(response.bodyUsed, true);
+    const cached = await stored.get('https://agentswarm.space/api/posts/post_full').response.clone().text();
+    assert.equal(JSON.parse(cached).result.reason, status);
+    assert.ok(!cached.includes(location));
+    assert.ok(!JSON.stringify(first).includes(location));
+  });
+}
 test('upstream diagnostics expose only HTTP status or timeout/network/parse categories across MCP, A2A and cache hits', async () => {
   const secret = 'MEMBER-OR-SECRET-ERROR';
   const cases = [
     [403, async () => new Response(secret, { status: 403, headers: { 'X-Private': secret } })],
     [503, async () => new Response(secret, { status: 503 })],
+    ['network', async () => Object.defineProperty(Response.error(), 'type', { value: 'opaqueredirect' })],
     ['timeout', async () => { throw new DOMException(secret, 'TimeoutError'); }],
     ['timeout', async () => { throw new DOMException(secret, 'AbortError'); }],
     ['network', async () => { throw new Error(secret); }],

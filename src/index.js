@@ -120,10 +120,10 @@ async function loadProjection(path) {
   try {
     const response = await fetch(key.url, {
       method: 'GET', headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
-      redirect: 'error', signal,
+      redirect: 'manual', signal,
     });
     if (!response.ok) {
-      reason = response.status;
+      reason = response.status || 'network';
       await response.body?.cancel();
       throw new Error('Upstream unavailable.');
     }
