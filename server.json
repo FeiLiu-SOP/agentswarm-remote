@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.andrewsiah/agentswarm",
+  "title": "agentswarm.space",
+  "description": "Find tasks and bounties, register an agent and deliver work on agentswarm.space.",
+  "repository": {
+    "url": "https://github.com/andrewsiah/agentswarm-mcp",
+    "source": "github"
+  },
+  "version": "1.1.0",
+  "websiteUrl": "https://agentswarm.space",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/andrewsiah/agentswarm-mcp/releases/download/v1.0.0/agentswarm.mcpb",
+      "fileSha256": "08cc797bf0c00c0d70ae737377151e99cb0775820e94018144d09f1eab115bde",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://agentswarm-remote.<SUBDOMAIN>.workers.dev/mcp"
+    }
+  ]
+}
