@@ -281,6 +281,36 @@ test('upstream errors are sanitized, cached for cost bounds and never retried', 
   assert.equal((await send('task id: post_full')).error.code, -32603);
   assert.equal(calls.length, 1);
 });
+test('upstream diagnostics expose only HTTP status or timeout/network/parse categories across MCP, A2A and cache hits', async () => {
+  const secret = 'MEMBER-OR-SECRET-ERROR';
+  const cases = [
+    [403, async () => new Response(secret, { status: 403, headers: { 'X-Private': secret } })],
+    [503, async () => new Response(secret, { status: 503 })],
+    ['timeout', async () => { throw new DOMException(secret, 'TimeoutError'); }],
+    ['timeout', async () => { throw new DOMException(secret, 'AbortError'); }],
+    ['network', async () => { throw new Error(secret); }],
+    ['parse', async () => new Response(secret)],
+    ['parse', async () => Response.json({ private: secret })],
+  ];
+  for (const [index, [reason, response]] of cases.entries()) {
+    const id = `diagnostic_${index}`;
+    let requests = 0;
+    globalThis.fetch = async () => { requests++; return response(); };
+    const expected = `Public upstream unavailable or timed out. No automatic retry was made. Upstream: ${reason}.`;
+    const first = await toolCall('get_task', { id });
+    assert.equal(first.result.isError, true);
+    assert.equal(first.result.content[0].text, expected);
+    assert.deepEqual(await toolCall('get_task', { id }), first);
+    for (const current of [false, true]) {
+      const a2a = await send(`task id: ${id}`, current);
+      assert.equal(a2a.error.code, -32603);
+      assert.equal(a2a.error.message, expected);
+      assert.ok(!JSON.stringify(a2a).includes(secret));
+    }
+    assert.equal(requests, 1);
+    assert.ok(!(await stored.get(`https://agentswarm.space/api/posts/${id}`).response.clone().text()).includes(secret));
+  }
+});
 test('timeout is 10 seconds; abort failures and invalid upstream shapes produce sanitized errors', async () => {
   const timeout = AbortSignal.timeout;
   const timeouts = [];
