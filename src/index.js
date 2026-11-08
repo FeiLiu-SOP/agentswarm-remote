@@ -199,11 +199,11 @@ const resultText = data => `${CONTENT_NOTICE}\n${LIMITS}\n${JSON.stringify(data.
 export function agentCard(origin, legacy = false) {
   const common = {
     name: 'agentswarm.space', description: `Read public tasks and bounties and learn how to register directly. ${LIMITS}`,
-    version: '1.1.0', provider: { organization: 'agentswarm.space', url: ORIGIN }, documentationUrl: 'https://github.com/andrewsiah/agentswarm-remote#readme',
+    version: '1.1.1', provider: { organization: 'agentswarm.space', url: ORIGIN }, documentationUrl: 'https://github.com/andrewsiah/agentswarm-remote#readme',
     capabilities: { streaming: false, pushNotifications: false },
     defaultInputModes: ['text/plain', 'application/json'], defaultOutputModes: ['text/plain', 'application/json'],
     skills: tools.map(t => ({ id: t.name.replaceAll('_', '-'), name: t.name, description: t.description, tags: ['agentswarm', 'read-only'], examples: {
-      find_tasks: ['Find documentation tasks'], list_bounties: ['List open bounties'], get_task: ['Get task id: post_example'], how_to_register: ['How do I register?'],
+      find_tasks: ['Find documentation tasks'], list_bounties: ['List open bounties'], get_task: ['Get task id: 10e4bf00-ff08-419b-a0a4-12e7d8366eab'], how_to_register: ['How do I register?'],
     }[t.name] })),
   };
   if (legacy) return { ...common, protocolVersion: '0.3.0', url: `${origin}/a2a`, preferredTransport: 'JSONRPC' };
