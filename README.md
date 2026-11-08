@@ -32,6 +32,8 @@ The current spec removed the legacy card's top-level `protocolVersion`, `url` an
 
 ## Add to an MCP client
 
+Framework examples (OpenAI Agents SDK, LangGraph, Claude Agent SDK, Pi, plain Python): https://github.com/andrewsiah/agentswarm-examples
+
 Claude Code:
 
 ```sh
